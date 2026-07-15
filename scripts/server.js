@@ -4,10 +4,16 @@
  * 部署到微信云托管后，自动免鉴权调用公众号API，无需配置IP白名单。
  *
  * 接口:
- *   POST /publish  - 推送文章到草稿箱
- *   GET  /health   - 健康检查
- *   GET  /test     - 免鉴权诊断
- *   GET  /         - 首页信息
+ *   POST /publish          - 推送文章到草稿箱
+ *   POST /menu/create      - 创建自定义菜单
+ *   GET  /menu/get         - 获取当前菜单
+ *   GET  /menu/delete      - 删除所有菜单
+ *   POST /article/publish  - 发布草稿文章（草稿→正式发布）
+ *   POST /draft/list       - 获取草稿列表
+ *   POST /material/list    - 获取素材列表
+ *   GET  /health           - 健康检查
+ *   GET  /test             - 免鉴权诊断
+ *   GET  /                 - 首页信息
  */
 const express = require('express');
 const multer  = require('multer');
@@ -43,6 +49,7 @@ app.use(express.urlencoded({ extended: true }));
 async function removeWatermark(imgBuffer) {
   /**
    * 去除AI生成图片右下角"图片由AI生成"水印
+   * 算法与Python版remove_watermark_v6一致：
    * 1. 扫描右下角60%宽×15%高区域
    * 2. 取上方紧邻区域深色像素作为背景色
    * 3. 找亮度差>60且自身亮度>100的文字像素
@@ -59,16 +66,19 @@ async function removeWatermark(imgBuffer) {
   const w = meta.width;
   const h = meta.height;
 
+  // 获取raw RGB像素
   const raw = await sharp(imgBuffer)
     .removeAlpha()
     .raw()
     .toBuffer();
 
+  // 扫描区域
   const scanW = Math.floor(w * 0.60);
   const scanH = Math.floor(h * 0.15);
   const scanLeft = w - scanW;
   const scanTop  = h - scanH;
 
+  // 取扫描区上方紧邻区域的深色背景色
   const sampleTop    = Math.max(0, scanTop - 40);
   const sampleBottom = scanTop;
   const colorCount = {};
@@ -91,6 +101,7 @@ async function removeWatermark(imgBuffer) {
     }
   }
 
+  // 找水印文字像素
   const bgLum = (bgR + bgG + bgB) / 3;
   let minX = w, maxX = 0, minY = h, maxY = 0;
   let found = false;
@@ -114,6 +125,7 @@ async function removeWatermark(imgBuffer) {
     return imgBuffer;
   }
 
+  // 扩展边缘
   const pad = 4;
   minX = Math.max(0, minX - pad);
   maxX = Math.min(w - 1, maxX + pad);
@@ -123,6 +135,7 @@ async function removeWatermark(imgBuffer) {
   const rectW = maxX - minX + 1;
   const rectH = maxY - minY + 1;
 
+  // 用SVG矩形覆盖水印区域
   const svgOverlay = Buffer.from(
     `<svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">` +
     `<rect x="${minX}" y="${minY}" width="${rectW}" height="${rectH}" fill="rgb(${bgR},${bgG},${bgB})"/>` +
@@ -142,6 +155,7 @@ async function removeWatermark(imgBuffer) {
 // ========== 微信API ==========
 
 async function uploadPermanentMaterial(imgBuffer, filename = 'cover.png') {
+  /** 上传永久素材（封面图）— 云托管免鉴权，无需access_token */
   const url = `${API_BASE}/cgi-bin/material/add_material?type=image`;
   const form = new FormData();
   form.append('media', imgBuffer, { filename, contentType: 'image/png' });
@@ -161,6 +175,7 @@ async function uploadPermanentMaterial(imgBuffer, filename = 'cover.png') {
 
 
 async function uploadContentImage(imgBuffer, filename = 'content.png') {
+  /** 上传正文配图 — 云托管免鉴权，无需access_token */
   const url = `${API_BASE}/cgi-bin/media/uploadimg`;
   const form = new FormData();
   form.append('media', imgBuffer, { filename, contentType: 'image/png' });
@@ -180,6 +195,7 @@ async function uploadContentImage(imgBuffer, filename = 'content.png') {
 
 
 async function createDraft(thumbMediaId, content, title, digest, author = '') {
+  /** 创建草稿 — 云托管免鉴权，无需access_token */
   const url = `${API_BASE}/cgi-bin/draft/add`;
   const article = {
     title,
@@ -195,6 +211,7 @@ async function createDraft(thumbMediaId, content, title, digest, author = '') {
   }
   const payload = { articles: [article] };
 
+  // Node.js默认UTF-8，不需要ensure_ascii
   const resp = await axios.post(url, payload, {
     headers: { 'Content-Type': 'application/json; charset=utf-8' },
     timeout: 60000
@@ -210,6 +227,12 @@ async function createDraft(thumbMediaId, content, title, digest, author = '') {
 // ========== Markdown转HTML ==========
 
 function mdToHtml(mdText, imageUrls) {
+  /**
+   * 将Markdown转换为微信公众号兼容的HTML
+   * imageUrls: Array of [desc, url]
+   * 支持占位符: [配图1] [配图1：xxx] [配图1:xxx] [配图1 xxx]
+   */
+  // 正则替换所有占位符变体
   mdText = mdText.replace(/\[配图(\d+)[：:\s][^\]]*\]/g, '__IMG_$1__');
   mdText = mdText.replace(/\[配图(\d+)\]/g, '__IMG_$1__');
 
@@ -295,6 +318,7 @@ app.post('/publish', upload.fields([
     const mdText = req.body.markdown || '';
     const removeWm = (req.body.remove_watermark || 'true').toLowerCase() === 'true';
 
+    // 字节数校验
     const titleBytes = Buffer.byteLength(title, 'utf-8');
     const digestBytes = Buffer.byteLength(digest, 'utf-8');
     if (titleBytes > 30) {
@@ -304,16 +328,19 @@ app.post('/publish', upload.fields([
       return res.status(400).json({ success: false, error: `摘要超过64字节（当前${digestBytes}字节）` });
     }
 
+    // 获取封面图
     if (!req.files || !req.files.cover || req.files.cover.length === 0) {
       return res.status(400).json({ success: false, error: '缺少封面图（cover字段）' });
     }
     let coverBuffer = req.files.cover[0].buffer;
 
+    // 去水印
     if (removeWm) {
       console.log('[INFO] 处理封面图去水印...');
       coverBuffer = await removeWatermark(coverBuffer);
     }
 
+    // 获取正文配图
     const contentImages = (req.files.images || []);
     const imageDataList = [];
     for (let i = 0; i < contentImages.length; i++) {
@@ -325,21 +352,26 @@ app.post('/publish', upload.fields([
       imageDataList.push(imgBuf);
     }
 
+    // 1. 云托管免鉴权模式：无需获取access_token，平台自动注入
     console.log(`[INFO] 标题: ${title} (${titleBytes}字节)`);
     console.log(`[INFO] 摘要: ${digest} (${digestBytes}字节)`);
     console.log(`[INFO] 云托管免鉴权模式，跳过token获取`);
 
+    // 2. 上传封面图
     const thumbMediaId = await uploadPermanentMaterial(coverBuffer, 'cover.png');
 
+    // 3. 上传正文配图
     const imageUrls = [];
     for (let i = 0; i < imageDataList.length; i++) {
       const url = await uploadContentImage(imageDataList[i], `image_${i + 1}.png`);
       imageUrls.push([`配图${i + 1}`, url]);
     }
 
+    // 4. 构建HTML
     const html = mdToHtml(mdText, imageUrls);
     console.log(`[INFO] HTML生成完成，长度: ${html.length} 字符`);
 
+    // 5. 创建草稿
     const mediaId = await createDraft(thumbMediaId, html, title, digest, author);
 
     res.json({
@@ -366,11 +398,19 @@ app.post('/publish', upload.fields([
 
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'wechat-publisher', runtime: 'nodejs', version: '2.0.0-noauth' });
+  res.json({ status: 'ok', service: 'wechat-publisher', runtime: 'nodejs', version: '3.0.0-noauth' });
 });
 
 
+// ========== 免鉴权诊断 ==========
+
 app.get('/test', async (req, res) => {
+  /**
+   * 测试云托管免鉴权是否生效
+   * 调用 /cgi-bin/draft/get（已授权接口）传一个假media_id
+   * 如果返回 errcode 41001 → access_token missing → 免鉴权没生效
+   * 如果返回其他 errcode（如 40007 invalid media_id）→ 免鉴权生效了
+   */
   try {
     const url = `${API_BASE}/cgi-bin/draft/get?media_id=test_12345`;
     console.log(`[TEST] 调用: ${url}`);
@@ -384,18 +424,35 @@ app.get('/test', async (req, res) => {
         mode: '免鉴权未生效',
         detail: 'access_token missing (errcode 41001)',
         wechat_response: resp.data,
-        suggestion: '检查云托管控制台云调用-开放接口服务是否已开启并配置了接口权限'
+        suggestion: '检查云托管控制台「云调用→开放接口服务」是否已开启并配置了接口权限'
+      });
+    } else if (errcode === 40007 || errcode === 40004) {
+      res.json({
+        success: true,
+        mode: '免鉴权已生效',
+        detail: 'access_token 已自动注入，API正常响应（media_id无效是预期的，因为我们传了假ID测试）',
+        wechat_response: resp.data
+      });
+    } else if (!errcode || errcode === 0) {
+      res.json({
+        success: true,
+        mode: '免鉴权已生效',
+        detail: 'API调用成功',
+        wechat_response: resp.data
       });
     } else {
       res.json({
         success: true,
-        mode: '免鉴权已生效',
-        detail: `errcode=${errcode}`,
+        mode: '免鉴权可能已生效（收到非41001错误）',
+        detail: `errcode=${errcode}, errmsg=${resp.data.errmsg}`,
         wechat_response: resp.data
       });
     }
   } catch (err) {
     console.error(`[TEST ERROR] ${err.message}`);
+    if (err.response) {
+      console.error(`[TEST ERROR DATA] ${JSON.stringify(err.response.data)}`);
+    }
     res.status(500).json({
       success: false,
       error: err.message,
@@ -405,12 +462,184 @@ app.get('/test', async (req, res) => {
 });
 
 
+// ========== 自定义菜单 ==========
+
+app.post('/menu/create', async (req, res) => {
+  /**
+   * 创建自定义菜单
+   * Body: { menu: { button: [...] } }
+   * 或直接传 button 数组: { buttons: [...] }
+   */
+  try {
+    const menuData = req.body.menu || { button: req.body.buttons || [] };
+    if (!menuData.button || menuData.button.length === 0) {
+      return res.status(400).json({ success: false, error: '缺少菜单数据（menu.button 或 buttons）' });
+    }
+
+    const url = `${API_BASE}/cgi-bin/menu/create`;
+    console.log(`[MENU] 创建菜单，按钮数: ${menuData.button.length}`);
+
+    const resp = await axios.post(url, menuData, {
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      timeout: 30000
+    });
+
+    console.log(`[MENU] 微信返回: ${JSON.stringify(resp.data)}`);
+
+    if (resp.data.errcode === 0 || !resp.data.errcode) {
+      res.json({ success: true, message: '菜单创建成功', wechat_response: resp.data });
+    } else {
+      res.json({ success: false, error: `菜单创建失败: errcode=${resp.data.errcode}, errmsg=${resp.data.errmsg}`, wechat_response: resp.data });
+    }
+  } catch (err) {
+    console.error(`[MENU CREATE ERROR] ${err.message}`);
+    res.status(500).json({ success: false, error: err.message, wechat_error: err.response ? err.response.data : null });
+  }
+});
+
+
+app.get('/menu/get', async (req, res) => {
+  /** 获取当前菜单配置 */
+  try {
+    const url = `${API_BASE}/cgi-bin/menu/get`;
+    const resp = await axios.get(url, { timeout: 15000 });
+    res.json({ success: true, menu: resp.data });
+  } catch (err) {
+    console.error(`[MENU GET ERROR] ${err.message}`);
+    res.status(500).json({ success: false, error: err.message, wechat_error: err.response ? err.response.data : null });
+  }
+});
+
+
+app.get('/menu/delete', async (req, res) => {
+  /** 删除所有自定义菜单 */
+  try {
+    const url = `${API_BASE}/cgi-bin/menu/delete`;
+    const resp = await axios.get(url, { timeout: 15000 });
+    console.log(`[MENU DELETE] 微信返回: ${JSON.stringify(resp.data)}`);
+    res.json({ success: true, message: '菜单已删除', wechat_response: resp.data });
+  } catch (err) {
+    console.error(`[MENU DELETE ERROR] ${err.message}`);
+    res.status(500).json({ success: false, error: err.message, wechat_error: err.response ? err.response.data : null });
+  }
+});
+
+
+// ========== 文章发布 ==========
+
+app.post('/article/publish', async (req, res) => {
+  /**
+   * 发布草稿箱中的文章（草稿→正式发布）
+   * Body: { media_id: "草稿的media_id" }
+   * 注意：发布后需要审核，审核通过后文章正式上线
+   */
+  try {
+    const mediaId = req.body.media_id;
+    if (!mediaId) {
+      return res.status(400).json({ success: false, error: '缺少 media_id（草稿的media_id）' });
+    }
+
+    const url = `${API_BASE}/cgi-bin/freepublish/submit`;
+    console.log(`[PUBLISH] 发布文章，media_id: ${mediaId}`);
+
+    const resp = await axios.post(url, { media_id: mediaId }, {
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      timeout: 30000
+    });
+
+    console.log(`[PUBLISH] 微信返回: ${JSON.stringify(resp.data)}`);
+
+    if (resp.data.errcode === 0 || !resp.data.errcode) {
+      res.json({
+        success: true,
+        publish_id: resp.data.publish_id,
+        message: '文章已提交发布，等待审核',
+        wechat_response: resp.data
+      });
+    } else {
+      res.json({
+        success: false,
+        error: `发布失败: errcode=${resp.data.errcode}, errmsg=${resp.data.errmsg}`,
+        wechat_response: resp.data
+      });
+    }
+  } catch (err) {
+    console.error(`[PUBLISH ERROR] ${err.message}`);
+    res.status(500).json({ success: false, error: err.message, wechat_error: err.response ? err.response.data : null });
+  }
+});
+
+
+// ========== 草稿列表 ==========
+
+app.post('/draft/list', async (req, res) => {
+  /**
+   * 获取草稿列表
+   * Body: { offset: 0, count: 20, no_content: 1 }
+   */
+  try {
+    const offset = req.body.offset || 0;
+    const count = req.body.count || 20;
+    const noContent = req.body.no_content !== undefined ? req.body.no_content : 1;
+
+    const url = `${API_BASE}/cgi-bin/draft/batchget_material`;
+    const payload = { offset, count, no_content: noContent };
+
+    const resp = await axios.post(url, payload, {
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      timeout: 30000
+    });
+
+    console.log(`[DRAFT LIST] 返回 ${resp.data.item_count || 0} 篇草稿`);
+    res.json({ success: true, data: resp.data });
+  } catch (err) {
+    console.error(`[DRAFT LIST ERROR] ${err.message}`);
+    res.status(500).json({ success: false, error: err.message, wechat_error: err.response ? err.response.data : null });
+  }
+});
+
+
+// ========== 素材列表 ==========
+
+app.post('/material/list', async (req, res) => {
+  /**
+   * 获取素材列表
+   * Body: { type: "image", offset: 0, count: 20 }
+   */
+  try {
+    const type = req.body.type || 'image';
+    const offset = req.body.offset || 0;
+    const count = req.body.count || 20;
+
+    const url = `${API_BASE}/cgi-bin/material/batchget_material`;
+    const payload = { type, offset, count };
+
+    const resp = await axios.post(url, payload, {
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      timeout: 30000
+    });
+
+    res.json({ success: true, data: resp.data });
+  } catch (err) {
+    console.error(`[MATERIAL LIST ERROR] ${err.message}`);
+    res.status(500).json({ success: false, error: err.message, wechat_error: err.response ? err.response.data : null });
+  }
+});
+
+
 app.get('/', (req, res) => {
   res.json({
     service: 'wechat-publisher',
     runtime: 'Node.js / Express',
+    version: '3.0.0-noauth',
     endpoints: {
       'POST /publish': '推送文章到草稿箱',
+      'POST /menu/create': '创建自定义菜单',
+      'GET  /menu/get': '获取当前菜单',
+      'GET  /menu/delete': '删除所有菜单',
+      'POST /article/publish': '发布草稿文章（草稿→正式发布）',
+      'POST /draft/list': '获取草稿列表',
+      'POST /material/list': '获取素材列表',
       'GET  /health': '健康检查',
       'GET  /test': '免鉴权诊断'
     }
@@ -418,6 +647,7 @@ app.get('/', (req, res) => {
 });
 
 
+// 启动服务
 const PORT = process.env.PORT || 80;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`[wechat-publisher] 服务已启动，监听端口 ${PORT}`);

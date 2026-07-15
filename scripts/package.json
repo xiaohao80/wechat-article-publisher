@@ -1,6 +1,6 @@
 {
   "name": "wechat-publisher",
-  "version": "1.0.0",
+  "version": "3.0.0",
   "description": "微信公众号草稿箱推送服务 - 微信云托管版",
   "main": "server.js",
   "scripts": {
